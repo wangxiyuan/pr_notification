@@ -6,7 +6,7 @@ GitHub API 封装模块
 import re
 import requests
 from typing import Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 
 class GitHubAPIError(Exception):
@@ -108,8 +108,7 @@ class PRMonitor:
             raise GitHubAPIError(f"请求失败: {str(e)}")
 
     def get_pr_status(self, owner: str, repo: str, pull_number: str) -> Dict[str, Any]:
-        """
-        获取PR的完整状态信息
+        """获取PR的完整状态信息
 
         Args:
             owner: 仓库所有者
@@ -212,21 +211,22 @@ class PRMonitor:
             owner: 用户名或组织名
 
         Returns:
-            仓库名列表
+            仓库名列表（按字母顺序排序）
         """
         try:
             # 先尝试作为组织获取
             url = f"{self.BASE_URL}/orgs/{owner}/repos"
-            response = self.session.get(url, timeout=10, params={'per_page': 100, 'sort': 'updated'})
+            response = self.session.get(url, timeout=10, params={'per_page': 100})
 
             # 如果不是组织，尝试作为用户获取
             if response.status_code == 404:
                 url = f"{self.BASE_URL}/users/{owner}/repos"
-                response = self.session.get(url, timeout=10, params={'per_page': 100, 'sort': 'updated'})
+                response = self.session.get(url, timeout=10, params={'per_page': 100})
 
             if response.status_code == 200:
                 repos = response.json()
-                return [repo['name'] for repo in repos]
+                # 按字母顺序排序（不区分大小写）
+                return sorted([repo['name'] for repo in repos], key=str.lower)
             else:
                 return []
         except Exception as e:
@@ -235,12 +235,18 @@ class PRMonitor:
 
     @staticmethod
     def _format_time(time_str: Optional[str]) -> str:
-        """格式化时间字符串"""
+        """格式化时间字符串（转换为UTC+8时区）"""
         if not time_str:
             return 'N/A'
 
         try:
+            # 解析ISO格式时间（UTC）
             dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
-            return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+            # 转换为UTC+8时区（北京时间）
+            utc_plus_8 = timezone(timedelta(hours=8))
+            dt_local = dt.astimezone(utc_plus_8)
+
+            return dt_local.strftime('%Y-%m-%d %H:%M:%S')
         except:
             return time_str

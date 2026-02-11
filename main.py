@@ -12,8 +12,8 @@ from PyQt5.QtWidgets import (
     QGroupBox, QMessageBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QComboBox
 )
-from PyQt5.QtCore import QTimer, QThread, pyqtSignal, Qt
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal, Qt, pyqtSlot, QMetaObject, Q_ARG, QUrl
+from PyQt5.QtGui import QFont, QColor, QDesktopServices
 from datetime import datetime
 from github_api import PRMonitor, GitHubAPIError
 
@@ -59,13 +59,22 @@ class PRMonitorGUI(QMainWindow):
         self.timer.timeout.connect(self.fetch_and_display)
         self.fetch_thread = None
 
+        # 倒计时相关
+        self.countdown_timer = QTimer()
+        self.countdown_timer.timeout.connect(self.update_countdown)
+        self.remaining_seconds = 0
+
+        # 最后刷新时间
+        self.last_refresh_time = None
+
         self.init_ui()
         self.load_config()  # 加载保存的配置
 
     def init_ui(self):
         """初始化UI - 支持多PR监控"""
-        self.setWindowTitle("GitHub PR 监控器 (多PR版)")
-        self.setGeometry(100, 100, 1000, 800)
+        self.setWindowTitle("GitHub PR 监控器")
+        self.setGeometry(100, 100, 1200, 900)  # 增大窗口尺寸
+        self.center()  # 居中显示
 
         # 创建中央部件
         central_widget = QWidget()
@@ -77,6 +86,7 @@ class PRMonitorGUI(QMainWindow):
 
         # ===== GitHub Token配置区域 =====
         token_group = QGroupBox("GitHub Token 配置")
+        token_group.setStyleSheet("QGroupBox { font-size: 12pt; font-weight: bold; }")
         token_layout = QHBoxLayout()
 
         token_label = QLabel("Token:")
@@ -96,14 +106,42 @@ class PRMonitorGUI(QMainWindow):
 
         # ===== PR管理区域 =====
         pr_manage_group = QGroupBox("PR 管理")
+        pr_manage_group.setStyleSheet("QGroupBox { font-size: 12pt; font-weight: bold; }")
         pr_manage_layout = QVBoxLayout()
 
-        # PR添加行
+        # PR添加行（三段式）
         add_pr_layout = QHBoxLayout()
-        pr_url_label = QLabel("PR链接:")
-        pr_url_label.setFixedWidth(60)
-        self.pr_url_input = QLineEdit()
-        self.pr_url_input.setPlaceholderText("https://github.com/owner/repo/pull/123")
+
+        # 用户名/组织名区域（含增删功能）
+        owner_label = QLabel("用户名/组织:")
+        owner_label.setFixedWidth(100)
+        self.owner_combo = QComboBox()
+        self.owner_combo.setEditable(True)  # 支持手动输入
+        self.owner_combo.addItem("vllm-project")  # 默认值
+        self.owner_combo.setFixedWidth(150)
+
+        # 添加用户名/组织名按钮
+        self.add_owner_button = QPushButton("添加")
+        self.add_owner_button.clicked.connect(self.add_owner)
+        self.add_owner_button.setFixedWidth(60)
+
+        # 删除用户名/组织名按钮
+        self.delete_owner_button = QPushButton("删除")
+        self.delete_owner_button.clicked.connect(self.delete_owner)
+        self.delete_owner_button.setFixedWidth(60)
+
+        # 仓库下拉菜单
+        repo_label = QLabel("仓库:")
+        repo_label.setFixedWidth(50)
+        self.repo_combo = QComboBox()
+        self.repo_combo.setFixedWidth(180)
+
+        # PR ID输入框
+        pr_id_label = QLabel("PR ID:")
+        pr_id_label.setFixedWidth(60)
+        self.pr_id_input = QLineEdit()
+        self.pr_id_input.setPlaceholderText("123")
+        self.pr_id_input.setFixedWidth(100)
 
         self.add_pr_button = QPushButton("添加PR")
         self.add_pr_button.clicked.connect(self.add_pr)
@@ -113,36 +151,95 @@ class PRMonitorGUI(QMainWindow):
         self.remove_pr_button.clicked.connect(self.remove_pr)
         self.remove_pr_button.setFixedWidth(100)
 
-        add_pr_layout.addWidget(pr_url_label)
-        add_pr_layout.addWidget(self.pr_url_input)
+        # 绑定用户名/组织名变化事件
+        self.owner_combo.currentTextChanged.connect(self.load_repos)
+
+        # 初始化仓库列表
+        self.load_repos("vllm-project")
+
+        add_pr_layout.addWidget(owner_label)
+        add_pr_layout.addWidget(self.owner_combo)
+        add_pr_layout.addWidget(self.add_owner_button)
+        add_pr_layout.addWidget(self.delete_owner_button)
+        add_pr_layout.addWidget(repo_label)
+        add_pr_layout.addWidget(self.repo_combo)
+        add_pr_layout.addWidget(pr_id_label)
+        add_pr_layout.addWidget(self.pr_id_input)
         add_pr_layout.addWidget(self.add_pr_button)
         add_pr_layout.addWidget(self.remove_pr_button)
 
-        # PR列表表格
-        self.pr_table = QTableWidget()
-        self.pr_table.setColumnCount(6)
-        self.pr_table.setHorizontalHeaderLabels(['PR链接', '标题', '状态', 'CI', '审查', '最后更新'])
-        self.pr_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.pr_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.pr_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.pr_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.pr_table.setMinimumHeight(200)
-
         pr_manage_layout.addLayout(add_pr_layout)
-        pr_manage_layout.addWidget(self.pr_table)
         pr_manage_group.setLayout(pr_manage_layout)
+
+        # ===== 监控状态区域（放在表格上方）=====
+        status_group = QGroupBox("监控状态")
+        status_group.setStyleSheet("QGroupBox { font-size: 12pt; font-weight: bold; }")
+        status_layout = QVBoxLayout()
+        self.status_label = QLabel("未开始监控 | PR数量: 0")
+        self.status_label.setStyleSheet("color: gray;")
+
+        # 倒计时标签
+        self.countdown_label = QLabel("下次刷新: --")
+        self.countdown_label.setStyleSheet("color: gray; font-size: 9pt;")
+
+        status_layout.addWidget(self.status_label)
+        status_layout.addWidget(self.countdown_label)
+        status_group.setLayout(status_layout)
+
+        # ===== PR列表表格 =====
+        pr_table_group = QGroupBox("PR 列表")
+        pr_table_group.setStyleSheet("QGroupBox { font-size: 12pt; font-weight: bold; }")
+        pr_table_layout = QVBoxLayout()
+
+        self.pr_table = QTableWidget()
+        self.pr_table.setColumnCount(9)  # 增加一列用于作者名
+        self.pr_table.setHorizontalHeaderLabels(['用户/组织', '仓库', 'PR ID', '标题', '作者', '状态', 'CI', '审查', '最后更新'])
+        self.pr_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.pr_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.pr_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.pr_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.pr_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.pr_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.pr_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.pr_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        self.pr_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        self.pr_table.setSelectionBehavior(QAbstractItemView.SelectItems)  # 允许选择单个单元格
+        self.pr_table.setSelectionMode(QAbstractItemView.SingleSelection)  # 单选模式
+        self.pr_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.pr_table.setMinimumHeight(400)  # 增大表格最小高度
+
+        # 添加单元格点击事件（用于点击PR ID打开链接）
+        self.pr_table.cellClicked.connect(self.on_cell_clicked)
+
+        # 添加右键菜单支持
+        self.pr_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.pr_table.customContextMenuRequested.connect(self.show_context_menu)
+
+        pr_table_layout.addWidget(self.pr_table)
+        pr_table_group.setLayout(pr_table_layout)
 
         # ===== 监控控制区域 =====
         control_group = QGroupBox("监控控制")
+        control_group.setStyleSheet("QGroupBox { font-size: 12pt; font-weight: bold; }")
         control_layout = QHBoxLayout()
 
         interval_label = QLabel("刷新间隔:")
         interval_label.setFixedWidth(80)
-        self.interval_spinbox = QSpinBox()
-        self.interval_spinbox.setRange(10, 300)
-        self.interval_spinbox.setValue(30)
-        self.interval_spinbox.setSuffix(" 秒")
-        self.interval_spinbox.setFixedWidth(100)
+
+        # 刷新间隔下拉选项
+        self.interval_combo = QComboBox()
+        self.interval_options = {
+            '10秒': 10,
+            '30秒': 30,
+            '1分钟': 60,
+            '3分钟': 180,
+            '5分钟': 300,
+            '30分钟': 1800,
+            '1小时': 3600
+        }
+        self.interval_combo.addItems(list(self.interval_options.keys()))
+        self.interval_combo.setCurrentText('30秒')  # 默认30秒
+        self.interval_combo.setFixedWidth(100)
 
         self.start_button = QPushButton("开始监控")
         self.start_button.clicked.connect(self.start_monitoring)
@@ -158,26 +255,19 @@ class PRMonitorGUI(QMainWindow):
         self.refresh_button.setFixedWidth(100)
 
         control_layout.addWidget(interval_label)
-        control_layout.addWidget(self.interval_spinbox)
+        control_layout.addWidget(self.interval_combo)
         control_layout.addWidget(self.start_button)
         control_layout.addWidget(self.stop_button)
         control_layout.addWidget(self.refresh_button)
         control_layout.addStretch()
         control_group.setLayout(control_layout)
 
-        # ===== 状态显示区域 =====
-        status_group = QGroupBox("监控状态")
-        status_layout = QVBoxLayout()
-        self.status_label = QLabel("未开始监控 | PR数量: 0")
-        self.status_label.setStyleSheet("color: gray;")
-        status_layout.addWidget(self.status_label)
-        status_group.setLayout(status_layout)
-
-        # 添加所有组件到主布局
+        # 添加所有组件到主布局（新的顺序）
         main_layout.addWidget(token_group)
         main_layout.addWidget(pr_manage_group)
+        main_layout.addWidget(status_group)  # 监控状态放在表格上方
+        main_layout.addWidget(pr_table_group)  # PR列表表格
         main_layout.addWidget(control_group)
-        main_layout.addWidget(status_group)
 
     def set_token(self):
         """设置GitHub Token"""
@@ -190,13 +280,112 @@ class PRMonitorGUI(QMainWindow):
             self.monitor.set_token(None)
             QMessageBox.information(self, "提示", "已清除Token")
 
+    def load_repos(self, owner):
+        """根据用户名/组织名加载仓库列表"""
+        if not owner:
+            return
+        
+        self.repo_combo.clear()
+        # 异步加载仓库列表（避免UI卡顿）
+        self.repo_combo.addItem("加载中...")
+        self.repo_combo.setEnabled(False)
+        
+        # 使用线程加载仓库列表
+        from threading import Thread
+        def fetch_repos():
+            repos = self.monitor.get_user_repos(owner)
+            # 在主线程更新UI
+            QMetaObject.invokeMethod(self, "_update_repo_combo", Qt.QueuedConnection, 
+                                    Q_ARG(list, repos))
+        
+        Thread(target=fetch_repos).start()
+    
+    @pyqtSlot(list)
+    def _update_repo_combo(self, repos):
+        """更新仓库下拉菜单"""
+        self.repo_combo.clear()
+        self.repo_combo.setEnabled(True)
+        if repos:
+            self.repo_combo.addItems(repos)
+        else:
+            self.repo_combo.addItem("无可用仓库")
+            self.repo_combo.setEnabled(False)
+    
+    def add_owner(self):
+        """添加用户名/组织名"""
+        owner_text = self.owner_combo.currentText().strip()
+        if not owner_text:
+            QMessageBox.warning(self, "警告", "请输入用户名/组织名")
+            return
+        
+        # 检查是否已存在
+        for i in range(self.owner_combo.count()):
+            if self.owner_combo.itemText(i) == owner_text:
+                QMessageBox.warning(self, "警告", "该用户名/组织名已存在")
+                return
+        
+        # 添加到下拉菜单
+        self.owner_combo.addItem(owner_text)
+        self.owner_combo.setCurrentText(owner_text)
+        
+        # 保存配置
+        self.save_config()
+        QMessageBox.information(self, "成功", f"已添加用户名/组织名: {owner_text}")
+    
+    def delete_owner(self):
+        """删除选中的用户名/组织名"""
+        current_index = self.owner_combo.currentIndex()
+        if current_index < 0:
+            QMessageBox.warning(self, "警告", "请先选择要删除的用户名/组织名")
+            return
+        
+        # 不允许删除最后一个选项
+        if self.owner_combo.count() == 1:
+            QMessageBox.warning(self, "警告", "至少需要保留一个用户名/组织名")
+            return
+        
+        # 不允许删除默认的vllm-project
+        if self.owner_combo.itemText(current_index) == "vllm-project":
+            QMessageBox.warning(self, "警告", "不允许删除默认的vllm-project")
+            return
+        
+        # 删除选中项
+        self.owner_combo.removeItem(current_index)
+        
+        # 保存配置
+        self.save_config()
+        QMessageBox.information(self, "成功", "已删除选中的用户名/组织名")
+        
+        # 重新加载当前选中用户名/组织名的仓库列表
+        self.load_repos(self.owner_combo.currentText())
+
+    def get_interval_seconds(self):
+        """获取当前选中的刷新间隔（秒）"""
+        current_text = self.interval_combo.currentText()
+        return self.interval_options.get(current_text, 30)
+
     def add_pr(self):
         """添加PR到监控列表"""
-        url = self.pr_url_input.text().strip()
+        # 获取三段式输入
+        owner = self.owner_combo.currentText().strip()
+        repo = self.repo_combo.currentText().strip()
+        pr_id = self.pr_id_input.text().strip()
 
-        if not url:
-            QMessageBox.warning(self, "警告", "请输入PR链接")
+        # 验证输入
+        if not owner:
+            QMessageBox.warning(self, "警告", "请输入用户名/组织名")
             return
+        
+        if not repo or repo == "加载中..." or repo == "无可用仓库":
+            QMessageBox.warning(self, "警告", "请选择有效的仓库")
+            return
+        
+        if not pr_id or not pr_id.isdigit():
+            QMessageBox.warning(self, "警告", "请输入有效的PR ID")
+            return
+
+        # 构建URL
+        url = f"https://github.com/{owner}/{repo}/pull/{pr_id}"
 
         # 检查是否已存在
         for pr in self.pr_list:
@@ -204,32 +393,54 @@ class PRMonitorGUI(QMainWindow):
                 QMessageBox.warning(self, "警告", "该PR已在监控列表中")
                 return
 
-        # 解析URL
-        pr_info = self.monitor.parse_pr_url(url)
-        if not pr_info:
-            QMessageBox.critical(
-                self,
-                "错误",
-                "无效的GitHub PR链接\n\n格式示例:\nhttps://github.com/owner/repo/pull/123"
-            )
-            return
+        try:
+            # 立即获取一次状态信息（包括标题和作者）
+            status = self.monitor.get_pr_status(owner, repo, pr_id)
+            
+            # 添加到列表
+            pr_info = {
+                'owner': owner,
+                'repo': repo,
+                'pull_number': pr_id,
+                'url': url,
+                'status': status  # 包含标题和作者的状态信息
+            }
+            self.pr_list.append(pr_info)
 
-        # 添加到列表
-        pr_info['url'] = url
-        pr_info['status'] = None
-        self.pr_list.append(pr_info)
+            # 更新表格
+            self.update_pr_table()
 
-        # 更新表格
-        self.update_pr_table()
+            # 清空输入框
+            self.pr_id_input.clear()
 
-        # 清空输入框
-        self.pr_url_input.clear()
+            # 更新状态
+            self.update_status(f"已添加PR | 总数: {len(self.pr_list)}", "success")
 
-        # 更新状态
-        self.update_status(f"已添加PR | 总数: {len(self.pr_list)}", "success")
-
-        # 保存配置
-        self.save_config()
+            # 保存配置
+            self.save_config()
+            
+        except GitHubAPIError as e:
+            # 如果获取状态失败，仍然添加PR，只是没有状态信息
+            pr_info = {
+                'owner': owner,
+                'repo': repo,
+                'pull_number': pr_id,
+                'url': url,
+                'status': None
+            }
+            self.pr_list.append(pr_info)
+            
+            # 更新表格
+            self.update_pr_table()
+            
+            # 清空输入框
+            self.pr_id_input.clear()
+            
+            # 更新状态
+            self.update_status(f"已添加PR | 总数: {len(self.pr_list)} | 警告: 无法获取状态信息 ({str(e)})")
+            
+            # 保存配置
+            self.save_config()
 
     def remove_pr(self):
         """删除选中的PR"""
@@ -260,9 +471,19 @@ class PRMonitorGUI(QMainWindow):
         self.pr_table.setRowCount(len(self.pr_list))
 
         for row, pr in enumerate(self.pr_list):
-            # PR链接
-            url_item = QTableWidgetItem(pr['url'])
-            self.pr_table.setItem(row, 0, url_item)
+            # 用户/组织
+            owner_item = QTableWidgetItem(pr['owner'])
+            self.pr_table.setItem(row, 0, owner_item)
+
+            # 仓库
+            repo_item = QTableWidgetItem(pr['repo'])
+            self.pr_table.setItem(row, 1, repo_item)
+
+            # PR ID (可点击)
+            pr_id_item = QTableWidgetItem(pr['pull_number'])
+            pr_id_item.setForeground(QColor(100, 180, 255))  # 浅蓝色，表示可点击
+            pr_id_item.setFont(QFont('Arial', 10, QFont.Bold))  # 加粗
+            self.pr_table.setItem(row, 2, pr_id_item)
 
             # 如果有状态信息，显示详细信息
             if pr.get('status'):
@@ -270,61 +491,68 @@ class PRMonitorGUI(QMainWindow):
 
                 # 标题
                 title_item = QTableWidgetItem(status.get('title', 'N/A'))
-                self.pr_table.setItem(row, 1, title_item)
+                self.pr_table.setItem(row, 3, title_item)
+                
+                # 作者
+                author_item = QTableWidgetItem(status.get('author', 'N/A'))
+                self.pr_table.setItem(row, 4, author_item)
 
                 # PR状态
                 state = status.get('state', 'unknown')
                 merged = status.get('merged', False)
                 if merged:
                     state_text = '✓ 已合并'
-                    state_color = QColor(0, 128, 0)
+                    state_color = QColor(0, 200, 0)  # 更亮的绿色
                 elif state == 'open':
                     state_text = '● 开放中'
-                    state_color = QColor(0, 0, 255)
+                    state_color = QColor(100, 180, 255)  # 浅蓝色
                 elif state == 'closed':
                     state_text = '✗ 已关闭'
-                    state_color = QColor(255, 0, 0)
+                    state_color = QColor(255, 100, 100)  # 更亮的红色
                 else:
                     state_text = state
-                    state_color = QColor(128, 128, 128)
+                    state_color = QColor(180, 180, 180)  # 更亮的灰色
 
                 state_item = QTableWidgetItem(state_text)
                 state_item.setForeground(state_color)
-                self.pr_table.setItem(row, 2, state_item)
+                self.pr_table.setItem(row, 5, state_item)
 
                 # CI状态
                 ci_status = status.get('ci_status', 'unknown')
                 ci_map = {
-                    'success': ('✓ 通过', QColor(0, 128, 0)),
-                    'pending': ('⏳ 进行中', QColor(255, 165, 0)),
-                    'failure': ('✗ 失败', QColor(255, 0, 0)),
-                    'error': ('✗ 错误', QColor(255, 0, 0)),
+                    'success': ('✓ 通过', QColor(0, 200, 0)),  # 更亮的绿色
+                    'pending': ('⏳ 进行中', QColor(255, 180, 0)),  # 更亮的橙色
+                    'failure': ('✗ 失败', QColor(255, 100, 100)),  # 更亮的红色
+                    'error': ('✗ 错误', QColor(255, 100, 100)),  # 更亮的红色
                 }
-                ci_text, ci_color = ci_map.get(ci_status, (ci_status, QColor(128, 128, 128)))
+                ci_text, ci_color = ci_map.get(ci_status, (ci_status, QColor(180, 180, 180)))
                 ci_item = QTableWidgetItem(ci_text)
                 ci_item.setForeground(ci_color)
-                self.pr_table.setItem(row, 3, ci_item)
+                self.pr_table.setItem(row, 6, ci_item)
 
                 # 审查状态
                 review_status = status.get('review_status', 'unknown')
                 review_map = {
-                    'approved': ('✓ 已批准', QColor(0, 128, 0)),
-                    'changes_requested': ('✗ 需修改', QColor(255, 0, 0)),
-                    'pending': ('⏳ 待审查', QColor(255, 165, 0)),
+                    'approved': ('✓ 已批准', QColor(0, 200, 0)),  # 更亮的绿色
+                    'changes_requested': ('✗ 需修改', QColor(255, 100, 100)),  # 更亮的红色
+                    'pending': ('⏳ 待审查', QColor(255, 180, 0)),  # 更亮的橙色
                 }
-                review_text, review_color = review_map.get(review_status, (review_status, QColor(128, 128, 128)))
+                review_text, review_color = review_map.get(review_status, (review_status, QColor(180, 180, 180)))
                 review_item = QTableWidgetItem(review_text)
                 review_item.setForeground(review_color)
-                self.pr_table.setItem(row, 4, review_item)
+                self.pr_table.setItem(row, 7, review_item)
 
                 # 最后更新
                 updated_item = QTableWidgetItem(status.get('updated_at', 'N/A'))
-                self.pr_table.setItem(row, 5, updated_item)
+                self.pr_table.setItem(row, 8, updated_item)
             else:
                 # 没有状态信息，显示占位符
-                for col in range(1, 6):
-                    placeholder_item = QTableWidgetItem('加载中...' if col == 1 else '-')
-                    placeholder_item.setForeground(QColor(128, 128, 128))
+                for col in range(3, 9):
+                    if col == 3:
+                        placeholder_item = QTableWidgetItem('')  # 标题默认为空
+                    else:
+                        placeholder_item = QTableWidgetItem('-')
+                    placeholder_item.setForeground(QColor(180, 180, 180))  # 更亮的灰色
                     self.pr_table.setItem(row, col, placeholder_item)
 
     def start_monitoring(self):
@@ -338,7 +566,7 @@ class PRMonitorGUI(QMainWindow):
         # 更新按钮状态
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.interval_spinbox.setEnabled(False)
+        self.interval_combo.setEnabled(False)
         self.add_pr_button.setEnabled(False)
         self.remove_pr_button.setEnabled(False)
 
@@ -349,23 +577,37 @@ class PRMonitorGUI(QMainWindow):
         self.fetch_and_display()
 
         # 启动定时器
-        interval = self.interval_spinbox.value() * 1000  # 转换为毫秒
+        interval = self.get_interval_seconds() * 1000  # 转换为毫秒
         self.timer.start(interval)
+
+        # 启动倒计时
+        self.remaining_seconds = self.get_interval_seconds()
+        self.countdown_timer.start(1000)  # 每秒更新一次
+        self.update_countdown()
 
     def stop_monitoring(self):
         """停止监控"""
         self.monitoring = False
         self.timer.stop()
+        self.countdown_timer.stop()
 
         # 更新按钮状态
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        self.interval_spinbox.setEnabled(True)
+        self.interval_combo.setEnabled(True)
         self.add_pr_button.setEnabled(True)
         self.remove_pr_button.setEnabled(True)
 
-        # 更新状态
-        self.update_status(f"已停止监控 | PR数量: {len(self.pr_list)}", "warning")
+        # 保存配置（包含最新的PR状态信息）
+        self.save_config()
+
+        # 更新状态（显示最后刷新时间）
+        if self.last_refresh_time:
+            self.update_status(f"已停止监控 | PR数量: {len(self.pr_list)} | 上次刷新: {self.last_refresh_time}", "warning")
+        else:
+            self.update_status(f"已停止监控 | PR数量: {len(self.pr_list)}", "warning")
+        self.countdown_label.setText("下次刷新: --")
+        self.countdown_label.setStyleSheet("color: gray; font-size: 9pt;")
 
     def fetch_and_display(self):
         """获取并显示所有PR信息"""
@@ -375,6 +617,9 @@ class PRMonitorGUI(QMainWindow):
         # 如果上一个线程还在运行，不启动新线程
         if self.fetch_thread and self.fetch_thread.isRunning():
             return
+
+        # 重置倒计时
+        self.remaining_seconds = self.get_interval_seconds()
 
         # 创建并启动后台线程
         self.fetch_thread = FetchThread(self.monitor, self.pr_list)
@@ -392,6 +637,12 @@ class PRMonitorGUI(QMainWindow):
 
         # 更新表格显示
         self.update_pr_table()
+
+        # 保存最后刷新时间（完整的日期时间）
+        self.last_refresh_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # 保存配置（持久化刷新时间）
+        self.save_config()
 
         # 更新状态
         current_time = datetime.now().strftime('%H:%M:%S')
@@ -441,36 +692,130 @@ class PRMonitorGUI(QMainWindow):
                 self.token_input.setText(token)
                 self.monitor.set_token(token)
 
-            # 加载PR列表
-            pr_urls = config.get('pr_list', [])
-            for url in pr_urls:
-                pr_info = self.monitor.parse_pr_url(url)
-                if pr_info:
-                    pr_info['url'] = url
-                    pr_info['status'] = None
-                    self.pr_list.append(pr_info)
+            # 加载用户名/组织名列表
+            owner_list = config.get('owner_list', [])
+            if owner_list:
+                self.owner_combo.clear()
+                self.owner_combo.addItems(owner_list)
+            else:
+                # 如果没有保存的列表，至少保留默认值
+                if self.owner_combo.count() == 0:
+                    self.owner_combo.addItem("vllm-project")
+
+            # 加载PR列表（兼容多种格式）
+            pr_list_data = config.get('pr_list', [])
+            for item in pr_list_data:
+                if isinstance(item, str):
+                    # 旧格式：URL字符串
+                    pr_info = self.monitor.parse_pr_url(item)
+                    if pr_info:
+                        pr_info['url'] = item
+                        pr_info['status'] = None
+                        self.pr_list.append(pr_info)
+                elif isinstance(item, dict):
+                    # 新格式：对象
+                    if 'url' in item and 'owner' in item and 'repo' in item and 'pull_number' in item:
+                        pr_info = {
+                            'url': item['url'],
+                            'owner': item['owner'],
+                            'repo': item['repo'],
+                            'pull_number': item['pull_number'],
+                            'status': None
+                        }
+
+                        # 如果有缓存的状态信息，恢复它
+                        if 'cached_status' in item:
+                                cached = item['cached_status']
+                                pr_info['status'] = {
+                                    'title': cached.get('title', ''),
+                                    'author': cached.get('author', ''),  # 加载保存的作者信息
+                                    'state': cached.get('state', ''),
+                                    'merged': cached.get('merged', False),
+                                    'ci_status': cached.get('ci_status', 'unknown'),
+                                    'review_status': cached.get('review_status', 'unknown'),
+                                    'updated_at': cached.get('updated_at', ''),
+                                    'created_at': '',  # 创建时间不缓存
+                                    'url': item['url']
+                                }
+
+                        self.pr_list.append(pr_info)
+                    else:
+                        # 如果只有url，尝试解析
+                        url = item.get('url', '')
+                        if url:
+                            pr_info = self.monitor.parse_pr_url(url)
+                            if pr_info:
+                                pr_info['url'] = url
+                                pr_info['status'] = None
+                                self.pr_list.append(pr_info)
 
             # 加载刷新间隔
             interval = config.get('interval', 30)
-            self.interval_spinbox.setValue(interval)
+            # 根据秒数找到对应的选项文本
+            interval_text = '30秒'  # 默认值
+            for text, seconds in self.interval_options.items():
+                if seconds == interval:
+                    interval_text = text
+                    break
+            self.interval_combo.setCurrentText(interval_text)
+
+            # 加载最后刷新时间
+            self.last_refresh_time = config.get('last_refresh_time', None)
 
             # 更新表格
             self.update_pr_table()
 
-            # 更新状态
+            # 初始化仓库列表
+            if self.owner_combo.count() > 0:
+                self.load_repos(self.owner_combo.currentText())
+
+            # 更新状态（显示最后刷新时间）
             if self.pr_list:
-                self.update_status(f"已加载配置 | PR数量: {len(self.pr_list)}", "success")
+                if self.last_refresh_time:
+                    self.update_status(f"已加载配置 | PR数量: {len(self.pr_list)} | 上次刷新: {self.last_refresh_time}", "success")
+                else:
+                    self.update_status(f"已加载配置 | PR数量: {len(self.pr_list)}", "success")
 
         except Exception as e:
             print(f"加载配置失败: {e}")
 
     def save_config(self):
-        """保存配置"""
+        """保存配置（包含PR的完整信息）"""
         try:
+            # 获取所有用户名/组织名
+            owner_list = []
+            for i in range(self.owner_combo.count()):
+                owner_list.append(self.owner_combo.itemText(i))
+
+            # 保存PR的完整信息（包括标题等状态信息）
+            pr_list_to_save = []
+            for pr in self.pr_list:
+                pr_data = {
+                    'url': pr['url'],
+                    'owner': pr['owner'],
+                    'repo': pr['repo'],
+                    'pull_number': pr['pull_number']
+                }
+                # 如果有状态信息，保存关键字段（包括作者）
+                if pr.get('status'):
+                    status = pr['status']
+                    pr_data['cached_status'] = {
+                        'title': status.get('title', ''),
+                        'author': status.get('author', ''),  # 保存作者信息
+                        'state': status.get('state', ''),
+                        'merged': status.get('merged', False),
+                        'ci_status': status.get('ci_status', 'unknown'),
+                        'review_status': status.get('review_status', 'unknown'),
+                        'updated_at': status.get('updated_at', '')
+                    }
+                pr_list_to_save.append(pr_data)
+
             config = {
                 'token': self.token_input.text().strip(),
-                'pr_list': [pr['url'] for pr in self.pr_list],
-                'interval': self.interval_spinbox.value()
+                'pr_list': pr_list_to_save,
+                'interval': self.get_interval_seconds(),
+                'owner_list': owner_list,
+                'last_refresh_time': self.last_refresh_time
             }
 
             with open(self.CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -479,25 +824,133 @@ class PRMonitorGUI(QMainWindow):
         except Exception as e:
             print(f"保存配置失败: {e}")
 
+    def center(self):
+        """将窗口居中显示在屏幕上"""
+        # 获取屏幕几何信息
+        screen_geometry = QApplication.desktop().screenGeometry()
+        
+        # 获取窗口几何信息
+        window_geometry = self.frameGeometry()
+        
+        # 计算窗口中心点
+        center_point = screen_geometry.center()
+        
+        # 将窗口中心点设置为屏幕中心点
+        window_geometry.moveCenter(center_point)
+        
+        # 将窗口移动到计算好的位置
+        self.move(window_geometry.topLeft())
+    
+    def on_cell_clicked(self, row, column):
+        """处理单元格点击事件"""
+        # 如果点击的是PR ID列（第2列），打开PR链接
+        if column == 2 and row < len(self.pr_list):
+            pr_url = self.pr_list[row]['url']
+            QDesktopServices.openUrl(QUrl(pr_url))
+
+    def show_context_menu(self, pos):
+        """显示右键菜单"""
+        from PyQt5.QtWidgets import QMenu, QAction
+
+        # 获取当前选中的单元格
+        selected_items = self.pr_table.selectedItems()
+        if not selected_items:
+            return
+
+        # 创建菜单
+        menu = QMenu(self)
+
+        # 添加复制动作
+        copy_action = QAction("复制", self)
+        copy_action.triggered.connect(self.copy_selected_text)
+        menu.addAction(copy_action)
+
+        # 显示菜单
+        menu.exec_(self.pr_table.viewport().mapToGlobal(pos))
+    
+    def copy_selected_text(self):
+        """复制选中的文本到剪贴板"""
+        selected_items = self.pr_table.selectedItems()
+        if selected_items:
+            # 将选中的文本复制到剪贴板
+            clipboard = QApplication.clipboard()
+            clipboard.setText(selected_items[0].text())
+    
+    def update_countdown(self):
+        """更新倒计时显示"""
+        if not self.monitoring:
+            return
+
+        self.remaining_seconds -= 1
+
+        if self.remaining_seconds < 0:
+            self.remaining_seconds = 0
+
+        # 格式化显示
+        minutes = self.remaining_seconds // 60
+        seconds = self.remaining_seconds % 60
+
+        if minutes > 0:
+            countdown_text = f"下次刷新: {minutes}分{seconds}秒"
+        else:
+            countdown_text = f"下次刷新: {seconds}秒"
+
+        # 根据剩余时间改变颜色
+        if self.remaining_seconds <= 5:
+            color = "red"
+        elif self.remaining_seconds <= 10:
+            color = "orange"
+        else:
+            color = "green"
+
+        self.countdown_label.setText(countdown_text)
+        self.countdown_label.setStyleSheet(f"color: {color}; font-size: 10pt; font-weight: bold;")
+
+    def closeEvent(self, event):
+        """窗口关闭事件 - 保存配置"""
+        # 如果正在监控，先停止
+        if self.monitoring:
+            self.stop_monitoring()
+        else:
+            # 如果没有监控，也保存配置
+            self.save_config()
+
+        event.accept()
+
     def update_status(self, message, status_type=""):
         """更新状态标签"""
         self.status_label.setText(message)
 
         if status_type == "success":
-            self.status_label.setStyleSheet("color: green;")
+            self.status_label.setStyleSheet("color: rgb(0, 200, 0);")  # 更亮的绿色
         elif status_type == "error":
-            self.status_label.setStyleSheet("color: red;")
+            self.status_label.setStyleSheet("color: rgb(255, 100, 100);")  # 更亮的红色
         elif status_type == "warning":
-            self.status_label.setStyleSheet("color: orange;")
+            self.status_label.setStyleSheet("color: rgb(255, 180, 0);")  # 更亮的橙色
         elif status_type == "info":
-            self.status_label.setStyleSheet("color: blue;")
+            self.status_label.setStyleSheet("color: rgb(100, 180, 255);")  # 浅蓝色
         else:
-            self.status_label.setStyleSheet("color: gray;")
+            self.status_label.setStyleSheet("color: rgb(180, 180, 180);")  # 更亮的灰色
 
 
 def main():
     """主函数"""
+    # 修复macOS上的IMK错误（error messaging the mach port for IMKCFRunLoopWakeUpReliable）
+    # 注意：这个错误在按Alt/Option键时会触发，不影响功能，只是系统层面的警告
+    # 完全隐藏需要在启动时重定向stderr: python main.py 2>&1 | grep -v IMK
+
+    # 设置环境变量，尝试减少IMK错误发生频率
+    os.environ['QT_MAC_WANTS_LAYER'] = '1'
+    os.environ['QT_IM_MODULE'] = ''
+
     app = QApplication(sys.argv)
+
+    # 禁用输入法，减少与macOS输入法管理器的交互
+    try:
+        app.inputMethod().reset()
+    except:
+        pass
+
     window = PRMonitorGUI()
     window.show()
     sys.exit(app.exec_())
